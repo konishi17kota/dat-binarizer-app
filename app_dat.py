@@ -19,7 +19,6 @@ import gc
 # =========================================================
 def check_password():
     if "APP_PASSWORD" not in st.secrets:
-        # Secretsに未設定の場合は開発用としてそのままパス
         return True
 
     correct_password = st.secrets["APP_PASSWORD"]
@@ -64,9 +63,6 @@ except ImportError:
 #  2. .dat ファイル読み込みパーサー (x, y, value)
 # =========================================================
 def parse_dat_file(file_bytes: bytes) -> np.ndarray:
-    """
-    3列 (x, y, value) のテキストデータを2D numpy配列 (float32) に変換
-    """
     text = file_bytes.decode("utf-8", errors="ignore")
     lines = text.strip().splitlines()
     
@@ -93,7 +89,7 @@ def parse_dat_file(file_bytes: bytes) -> np.ndarray:
 
 
 # =========================================================
-#  3. 二値化処理パイプライン (提示コードと同一ロジック)
+#  3. 二値化処理パイプライン
 # =========================================================
 def binarize_field_image(img_2d: np.ndarray, 
                          gauss_small=1.5, gauss_large=5.0, 
@@ -102,13 +98,11 @@ def binarize_field_image(img_2d: np.ndarray,
                          fill_holes=False, clip_percentile=99.7):
     img_float = img_2d.astype(np.float32)
 
-    # Difference of Gaussians (DoG)
     blur_small = gaussian_filter(img_float, sigma=gauss_small)
     blur_large = gaussian_filter(img_float, sigma=gauss_large)
     dog_img = blur_small - blur_large
     dog_img[dog_img < 0] = 0.0
 
-    # パーセンタイルクリッピングによる正規化
     pos_vals = dog_img[dog_img > 0]
     if len(pos_vals) > 0:
         v_high = float(np.percentile(pos_vals, clip_percentile))
@@ -121,18 +115,15 @@ def binarize_field_image(img_2d: np.ndarray,
     else:
         dog_norm = np.zeros_like(dog_img)
 
-    # 閾値処理
     if th_mode == "Otsu（自動）":
         th_val = float(filters.threshold_otsu(dog_norm))
     else:
         th_val = float(manual_th)
     bw = dog_norm > th_val
 
-    # 穴埋め
     if fill_holes:
         bw = binary_fill_holes(bw)
 
-    # 粒子面積フィルタリング
     labeled = measure.label(bw)
     props = measure.regionprops(labeled)
     bw_filtered = np.zeros_like(bw, dtype=bool)
@@ -157,12 +148,11 @@ def generate_dat_pdf_report(records, img_dict):
             norm_dog = imgs["dog"]
             bw_im = imgs["mask"]
 
-            # 正規化表示用
             r_disp = (raw_im - raw_im.min()) / (raw_im.max() - raw_im.min() + 1e-7)
 
             fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-            title_text = f"[{idx+1}] File: {fname} | Area Frac: {rec['Area_Fraction(%)']}% | q-value: {rec['q-value']} | Grid: {rec['Grid_Size']}"
-            fig.suptitle(title_text, fontsize=10, y=1.02)
+            title_text = f"[{idx+1}] File: {fname} | Out: {rec.get('Output_Name', fname)} | Area Frac: {rec['Area_Fraction(%)']}% | q-val: {rec['q-value']}"
+            fig.suptitle(title_text, fontsize=9.5, y=1.02)
 
             axes[0].imshow(r_disp, cmap="viridis")
             axes[0].set_title("1. Raw Field (dat)", fontsize=10)
@@ -176,7 +166,6 @@ def generate_dat_pdf_report(records, img_dict):
             axes[2].set_title("3. Binary Mask", fontsize=10)
             axes[2].axis("off")
 
-            # オーバーレイ (背景グレー + マスク赤)
             overlay = np.stack([r_disp]*3, axis=-1)
             overlay[bw_im] = [1.0, 0.2, 0.2]
             axes[3].imshow(np.clip(overlay, 0.0, 1.0))
@@ -201,7 +190,22 @@ st.set_page_config(page_title=".dat 二値化・解析システム", layout="wid
 st.title("🧪 .dat グリッドデータ 一括二値化・q値解析システム")
 st.caption("x y value 形式の .dat データを読み込み、DoGフィルタ＋閾値処理で二値化画像を自動生成します。")
 
-# サイドバー：パラメータ設定
+# サイドバー：ファイル名設定
+st.sidebar.header("🏷️ 出力ファイル名設定")
+p_prefix = st.sidebar.text_input(
+    "ファイル名の接頭辞 (Prefix)",
+    value="",
+    placeholder="例: Exp01_ (空欄なら付与しません)",
+    help="設定すると出力画像名が「[設定した文字]phi00XX_binary_mask.png」になります。"
+)
+# 接頭辞の末尾アンダースコアなどの扱いを整える
+prefix_str = p_prefix.strip()
+if prefix_str and not prefix_str.endswith(("_", "-")):
+    prefix_str += "_"
+
+st.sidebar.markdown("---")
+
+# サイドバー：二値化パラメータ設定
 st.sidebar.header("🛠 二値化パラメータ設定")
 p_small = st.sidebar.slider("DoG 小シグマ (Gauss Small)", 0.5, 5.0, 1.5, step=0.1)
 p_large = st.sidebar.slider("DoG 大シグマ (Gauss Large)", 2.0, 15.0, 5.0, step=0.5)
@@ -225,8 +229,6 @@ if uploaded_files:
     cache_images = {}
 
     st.subheader(f"📁 アップロード済み: {len(uploaded_files)} ファイル")
-
-    # プログレスバー
     progress_bar = st.progress(0.0)
     
     for idx, f in enumerate(uploaded_files):
@@ -260,9 +262,13 @@ if uploaded_files:
         area_frac = round((mask_pixels / total_pixels) * 100, 3) if total_pixels > 0 else 0.0
         q_val = calculate_q_value(bw_mask)
 
+        # ★ 出力ファイル名を作成（接頭辞を反映）
+        out_png_name = f"{prefix_str}{base_name}_binary_mask.png"
+
         # レコード蓄積
         records.append({
             "Filename": f.name,
+            "Output_Name": out_png_name,
             "Grid_Size": f"{W}x{H}",
             "Total_Pixels": total_pixels,
             "Positive_Pixels": mask_pixels,
@@ -280,7 +286,7 @@ if uploaded_files:
         mask_bytes = buf_mask.getvalue()
 
         zip_images.append({
-            "filename": f"{base_name}_binary_mask.png",
+            "filename": out_png_name,
             "data": mask_bytes
         })
 
@@ -288,7 +294,8 @@ if uploaded_files:
             "raw": raw_grid,
             "dog": dog_norm,
             "mask": bw_mask,
-            "mask_bytes": mask_bytes
+            "mask_bytes": mask_bytes,
+            "out_png_name": out_png_name
         }
 
         progress_bar.progress((idx + 1) / len(uploaded_files))
@@ -306,14 +313,14 @@ if uploaded_files:
         p_col1, p_col2, p_col3 = st.columns(3)
         raw_disp = (sel_imgs["raw"] - sel_imgs["raw"].min()) / (sel_imgs["raw"].max() - sel_imgs["raw"].min() + 1e-7)
 
-        p_col1.image(raw_disp, caption=f"元データ (Normalized {sel_rec['Grid_Size']})", width="stretch")
-        p_col2.image(sel_imgs["dog"], caption=f"DoG フィルタ後", width="stretch")
-        p_col3.image(sel_imgs["mask"].astype(np.uint8) * 255, caption=f"二値化マスク (面積分率: {sel_rec['Area_Fraction(%)']}%)", width="stretch")
+        p_col1.image(raw_disp, caption=f"元データ ({sel_rec['Grid_Size']})", use_container_width=True)
+        p_col2.image(sel_imgs["dog"], caption="DoG フィルタ後", use_container_width=True)
+        p_col3.image(sel_imgs["mask"].astype(np.uint8) * 255, caption=f"二値化マスク (面積分率: {sel_rec['Area_Fraction(%)']}%)", use_container_width=True)
 
         st.download_button(
-            label="📥 選択中画像の二値化PNGを保存",
+            label=f"📥 「{sel_imgs['out_png_name']}」を単体保存",
             data=sel_imgs["mask_bytes"],
-            file_name=f"{os.path.splitext(selected_view)[0]}_binary.png",
+            file_name=sel_imgs["out_png_name"],
             mime="image/png"
         )
 
@@ -323,10 +330,8 @@ if uploaded_files:
     df_results = pd.DataFrame(records)
     st.dataframe(df_results, use_container_width=True)
 
-    # CSV
     csv_bytes = df_results.to_csv(index=False).encode("utf-8_sig")
 
-    # ZIP
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for item in zip_images:
@@ -338,7 +343,7 @@ if uploaded_files:
         st.download_button(
             label="📊 解析CSVをダウンロード",
             data=csv_bytes,
-            file_name="dat_binarization_results.csv",
+            file_name=f"{prefix_str}dat_binarization_results.csv",
             mime="text/csv",
             type="primary",
             use_container_width=True
@@ -347,7 +352,7 @@ if uploaded_files:
         st.download_button(
             label=f"📦 二値化マスク画像一括ZIP保存 ({len(zip_images)} 枚)",
             data=zip_bytes,
-            file_name="dat_binary_masks.zip",
+            file_name=f"{prefix_str}dat_binary_masks.zip",
             mime="application/zip",
             use_container_width=True
         )
@@ -358,7 +363,7 @@ if uploaded_files:
                 st.download_button(
                     label=f"⬇️ クリックしてPDFを保存 ({len(records)} ページ)",
                     data=pdf_data,
-                    file_name="dat_analysis_report.pdf",
+                    file_name=f"{prefix_str}dat_analysis_report.pdf",
                     mime="application/pdf",
                     type="primary",
                     use_container_width=True
